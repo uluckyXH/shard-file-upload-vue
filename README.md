@@ -1,2 +1,3 @@
-# shard-file-upload-vue
-分片文件上传案例前端
+# shard-file-upload
+文件分片上传前端
+
