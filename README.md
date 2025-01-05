@@ -2,6 +2,10 @@
 
 一个基于 Vue 3 + TypeScript 开发的现代化文件上传管理系统，支持大文件分片上传。
 
+## 后端项目
+
+后端项目地址：[shard-file-upload](https://github.com/uluckyXH/shard-file-upload)
+
 ## 技术栈
 
 - **前端框架**: Vue 3
