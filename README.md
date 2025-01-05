@@ -2,6 +2,10 @@
 
 一个基于 Vue 3 + TypeScript 开发的现代化文件上传管理系统，支持大文件分片上传。
 
+## 演示
+
+![演示](./github-gif.gif)
+
 ## 后端项目
 
 后端项目地址：[shard-file-upload](https://github.com/uluckyXH/shard-file-upload)
@@ -23,7 +27,6 @@
 
 - ✨ 支持普通上传和分片上传两种模式
 - 📦 大文件自动切片处理
-- 🚀 分片并发上传
 - 📊 实时上传进度
 - ⚡ 失败分片自动重试
 
