@@ -1,9 +1,9 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { Upload, Plus, Document, View, Download, Search, InfoFilled, Loading, PictureFilled } from '@element-plus/icons-vue'
 import type { UploadFile } from 'element-plus'
 import { fileApi } from '@/api/file'
-import type { FileInfo } from '@/api/file'
+import type { FileInfo, FileConfig, ChunkInfo } from '@/api/file'
 import { ElMessage } from 'element-plus'
 
 const title = ref('文件上传管理系统')
@@ -28,12 +28,33 @@ const detailVisible = ref(false)
 const currentFile = ref<FileInfo | null>(null)
 
 // 进度状态
-const loadingText = ref('处理中...')
+const loadingText = ref('Loding...')
 
 // 图片预览相关
 const previewVisible = ref(false)
 const previewUrl = ref('')
 const previewTitle = ref('')
+
+// 文件配置
+const fileConfig = ref<FileConfig>({
+  chunkSize: 5,
+  maxFileSize: 100,
+  storageType: 'LOCAL'
+})
+
+// 分片上传相关
+const uploadFile = ref<File | null>(null)
+const chunks = ref<ChunkInfo[]>([])
+const uploadProgress = ref(0)
+const currentUploadId = ref<string>('')  // 保存当前上传ID
+const mergeError = ref(false)  // 合并失败标记
+
+// 添加上传状态控制
+const isUploading = ref(false)
+const uploadComplete = ref(false)
+
+// 添加控制变量
+const showChunkList = ref(true)
 
 // 获取文件列表
 const getFileList = async () => {
@@ -124,8 +145,26 @@ const handleTabChange = (tab: string) => {
   }
 }
 
+// 获取文件配置
+const getFileConfig = async () => {
+  try {
+    const config = await fileApi.getConfig()
+    console.log('获取到文件配置:', config)
+    fileConfig.value = config
+  } catch (error) {
+    console.error('获取文件配置失败:', error)
+    ElMessage.error('获取文件配置失败')
+  }
+}
+
 // 处理文件上传
 const handleUpload = async (file: File) => {
+  // 检查文件大小
+  if (file.size > fileConfig.value.maxFileSize * 1024 * 1024) {
+    ElMessage.error(`文件大小不能超过 ${fileConfig.value.maxFileSize}MB`)
+    return
+  }
+
   try {
     uploadLoading.value = true
     loading.value = true
@@ -161,8 +200,263 @@ const handleChange = (uploadFile: UploadFile) => {
   }
 }
 
+// 绘制loding svg
+const svg = `
+        <path class="path" d="
+          M 30 15
+          L 28 17
+          M 25.61 25.61
+          A 15 15, 0, 0, 1, 15 30
+          A 15 15, 0, 1, 1, 27.99 7.5
+          L 15 15
+        " style="stroke-width: 4px; fill: rgba(0, 0, 0, 0)"/>
+      `
+
+// 修改初始化上传方法，使用正确的文件大小限制
+const initUpload = async (file: File) => {
+  if (!file || !(file instanceof File)) {
+    ElMessage.error('无效的文件')
+    return
+  }
+
+  try {
+    // 检查文件大小（使用后端配置的maxFileSize，单位是MB）
+    if (file.size > fileConfig.value.maxFileSize * 1024 * 1024) {
+      ElMessage.error(`文件大小不能超过 ${fileConfig.value.maxFileSize}MB`)
+      return
+    }
+
+    // 检查文件是否可读
+    try {
+      const slice = file.slice(0, 1024)
+      await slice.arrayBuffer()
+    } catch (error) {
+      console.error('文件读取测试失败:', error)
+      ElMessage.error('文件无法读取，请检查文件权限或重新选择文件')
+      return
+    }
+
+    loadingText.value = '初始化上传...'
+    loading.value = true
+
+    // 计算文件MD5
+    try {
+      loadingText.value = '计算文件特征值...'
+      const md5 = await fileApi.calculateMD5(file)
+
+      // 准备文件信息
+      const fileInfo: Partial<FileInfo> = {
+        originalFileName: file.name,
+        fileSize: file.size,
+        md5: md5
+      }
+
+      // 初始化分片上传
+      const result = await fileApi.initiateMultipartUpload(fileInfo)
+      console.log('初始化成功:', result)
+
+      // 开始上传分片
+      await uploadChunks(result.uploadId!)
+    } catch (error) {
+      console.error('文件处理失败:', error)
+      const err = error as Error
+      ElMessage.error(err.message || '文件处理失败，请重试')
+      throw error
+    }
+  } catch (error) {
+    console.error('初始化上传失败:', error)
+    // 清理状态
+    uploadFile.value = null
+    chunks.value = []
+  } finally {
+    loading.value = false
+    loadingText.value = '处理中...'
+  }
+}
+
+// 修改文件选择处理方法
+const handleFileSelect = async (event: Event) => {
+  // 如果正在上传或已完成但未确认，不允许选择新文件
+  if (isUploading.value || uploadComplete.value) {
+    ElMessage.warning('请等待当前上传完成并确认后再选择新文件')
+    return
+  }
+
+  const input = event.target as HTMLInputElement
+  if (!input.files || input.files.length === 0) {
+    return
+  }
+
+  try {
+    const file = input.files[0]
+
+    // 检查文件大小（使用后端配置的maxFileSize，单位是MB）
+    if (file.size > fileConfig.value.maxFileSize * 1024 * 1024) {
+      ElMessage.error(`文件大小不能超过 ${fileConfig.value.maxFileSize}MB`)
+      return
+    }
+
+    // 检查文件是否为空
+    if (file.size === 0) {
+      ElMessage.error('不能上传空文件')
+      return
+    }
+
+    uploadFile.value = file
+    // 创建文件分片（使用后端配置的chunkSize，单位是MB）
+    chunks.value = fileApi.createFileChunks(file, fileConfig.value.chunkSize)
+    // 初始化上传
+    await initUpload(file)
+  } catch (error) {
+    console.error('文件处理失败:', error)
+    const err = error as Error
+    ElMessage.error(err.message || '文件处理失败，请重新选择文件')
+  } finally {
+    // 重置 input，确保可以重新选择相同的文件
+    input.value = ''
+  }
+}
+
+// 更新总进度的方法
+const updateTotalProgress = () => {
+  const totalProgress = chunks.value.reduce((sum, chunk) => sum + chunk.progress, 0)
+  uploadProgress.value = Math.floor(totalProgress / chunks.value.length)
+}
+
+// 修改上传单个分片的方法
+const uploadSingleChunk = async (chunk: ChunkInfo) => {
+  try {
+    chunk.status = 'uploading'
+    await fileApi.uploadChunk(currentUploadId.value, chunk)
+    chunk.status = 'success'
+    chunk.progress = 100
+    // 更新总进度
+    updateTotalProgress()
+    return true
+  } catch (error) {
+    console.error(`分片 ${chunk.index + 1} 上传失败:`, error)
+    chunk.status = 'error'
+    chunk.progress = 0
+    // 更新总进度
+    updateTotalProgress()
+    return false
+  }
+}
+
+// 修改重试上传单个分片的方法
+const retryChunk = async (chunk: ChunkInfo) => {
+  if (!currentUploadId.value) {
+    ElMessage.error('上传ID已失效，请重新上传')
+    return
+  }
+  const success = await uploadSingleChunk(chunk)
+  if (success) {
+    // 检查是否所有分片都上传成功
+    checkAndMerge()
+  }
+}
+
+// 检查并合并分片
+const checkAndMerge = async () => {
+  const allSuccess = chunks.value.every(chunk => chunk.status === 'success')
+  if (allSuccess) {
+    await mergeChunks()
+  }
+}
+
+// 合并分片
+const mergeChunks = async () => {
+  try {
+    loadingText.value = '合并文件中...'
+    loading.value = true
+    mergeError.value = false
+
+    await fileApi.mergeChunks(currentUploadId.value)
+    ElMessage.success('文件上传成功')
+
+    // 不再立即清理状态，等待用户确认
+    if (activeTab.value === 'list') {
+      await getFileList()
+    }
+  } catch (error) {
+    console.error('文件合并失败:', error)
+    ElMessage.error('文件合并失败')
+    mergeError.value = true
+  } finally {
+    loading.value = false
+    loadingText.value = '处理中...'
+  }
+}
+
+// 重试合并
+const retryMerge = async () => {
+  if (!currentUploadId.value) {
+    ElMessage.error('上传ID已失效，请重新上传')
+    return
+  }
+  await mergeChunks()
+}
+
+// 修改上传分片的方法
+const uploadChunks = async (uploadId: string) => {
+  try {
+    loading.value = true
+    loadingText.value = '上传分片中...'
+    currentUploadId.value = uploadId
+    mergeError.value = false
+    isUploading.value = true
+
+    // 串行上传分片
+    for (let i = 0; i < chunks.value.length; i++) {
+      const chunk = chunks.value[i]
+      await uploadSingleChunk(chunk)
+    }
+
+    // 检查是否所有分片都上传成功
+    const allSuccess = chunks.value.every(chunk => chunk.status === 'success')
+    if (allSuccess) {
+      await mergeChunks()
+      uploadComplete.value = true
+    }
+  } catch (error) {
+    console.error('分片上传失败:', error)
+    ElMessage.error('分片上传失败')
+  } finally {
+    loading.value = false
+    loadingText.value = '处理中...'
+    isUploading.value = false
+  }
+}
+
+// 添加确认完成方法
+const confirmUpload = () => {
+  // 清理状态
+  chunks.value = []
+  uploadProgress.value = 0
+  uploadFile.value = null
+  currentUploadId.value = ''
+  uploadComplete.value = false
+  // 重置文件输入框
+  const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement
+  if (fileInput) {
+    fileInput.value = ''
+  }
+}
+
+// 修改计算属性，失败的排在最上面，其他按索引排序
+const sortedChunks = computed(() => {
+  return [...chunks.value].sort((a, b) => {
+    // 失败的排在最上面
+    if (a.status === 'error' && b.status !== 'error') return -1
+    if (b.status === 'error' && a.status !== 'error') return 1
+    // 其他情况按照索引排序
+    return a.index - b.index
+  })
+})
+
 // 页面加载时获取文件列表
 onMounted(() => {
+  getFileConfig()
   getFileList()
 })
 </script>
@@ -208,17 +502,19 @@ onMounted(() => {
                     </template>
                   </el-input>
                   <el-upload ref="uploadRef" class="upload-button" action="#" :auto-upload="false"
-                    :show-file-list="false" :on-change="handleChange" :disabled="uploadLoading">
-                    <el-button type="primary" :loading="uploadLoading" :icon="uploadLoading ? Loading : Upload">
-                      {{ uploadLoading ? '上传中...' : '上传文件' }}
-                    </el-button>
+                    :show-file-list="false" :on-change="handleChange" :disabled="uploadLoading" :accept="'*'">
+                    <el-tooltip effect="dark" :content="`单文件大小限制: ${fileConfig.maxFileSize}MB`" placement="top">
+                      <el-button type="primary" :loading="uploadLoading" :icon="uploadLoading ? Loading : Upload">
+                        {{ uploadLoading ? '上传中...' : '上传文件' }}
+                      </el-button>
+                    </el-tooltip>
                   </el-upload>
                 </div>
 
                 <!-- 文件列表表格 -->
                 <el-table v-loading="loading" :data="tableData" style="width: 100%" border :resizable="false"
-                  :element-loading-text="loadingText" element-loading-spinner="el-icon-loading"
-                  element-loading-background="rgba(255, 255, 255, 0.8)">
+                  :element-loading-text="loadingText" :element-loading-svg="svg"
+                  element-loading-svg-view-box="-10, -10, 50, 50" element-loading-background="rgba(255, 255, 255, 0.9)">
                   <template v-if="loading">
                     <el-table-column v-for="i in 5" :key="i">
                       <template #default>
@@ -295,11 +591,74 @@ onMounted(() => {
                 </el-icon>
                 <span>分片上传</span>
               </template>
-              <div class="upload-area">
-                <el-button type="primary" size="large" :icon="Plus">
-                  选择文件
+              <div class="upload-area" @click="$refs.fileInput.click()">
+                <input type="file" ref="fileInput" style="display: none" @change="handleFileSelect"
+                  :disabled="isUploading || uploadComplete">
+                <el-button type="primary" size="large" :icon="Plus" :disabled="isUploading || uploadComplete">
+                  {{ isUploading ? '上传中...' : uploadComplete ? '上传完成' : '选择文件' }}
                 </el-button>
-                <p class="upload-tip">支持大文件上传，自动进行分片处理</p>
+                <p class="upload-tip">
+                  支持大文件上传，自动进行分片处理
+                  <br>
+                  <small>
+                    单文件大小限制: {{ fileConfig.maxFileSize }}MB，
+                    分片大小: {{ fileConfig.chunkSize }}MB
+                  </small>
+                </p>
+              </div>
+
+              <!-- 分片上传进度 -->
+              <div v-if="chunks.length > 0" class="chunks-progress">
+                <div class="progress-header">
+                  <div class="progress-info">
+                    <h3>{{ uploadFile?.name }}</h3>
+                    <p>总进度: {{ uploadProgress }}%</p>
+                  </div>
+                  <el-button link type="primary" @click="showChunkList = !showChunkList">
+                    {{ showChunkList ? '隐藏分片' : '显示分片' }}
+                  </el-button>
+                </div>
+                <el-progress :percentage="uploadProgress" />
+
+                <!-- 分片列表 -->
+                <div v-show="showChunkList" class="chunks-list-container">
+                  <div class="chunks-list">
+                    <div v-for="chunk in sortedChunks" :key="chunk.hash" class="chunk-item">
+                      <span>分片 {{ chunk.index + 1 }}</span>
+                      <div class="chunk-progress">
+                        <el-progress :percentage="chunk.progress"
+                          :status="chunk.status === 'error' ? 'exception' : undefined" />
+                        <el-button v-if="chunk.status === 'error'" type="primary" link @click="retryChunk(chunk)">
+                          重试
+                        </el-button>
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <!-- 合并失败时显示重试按钮 -->
+                <div v-if="mergeError" class="merge-error">
+                  <el-alert title="文件合并失败" type="error" :closable="false" show-icon>
+                    <template #default>
+                      请点击重试按钮进行重新合并
+                    </template>
+                  </el-alert>
+                  <el-button type="primary" @click="retryMerge">
+                    重试合并
+                  </el-button>
+                </div>
+
+                <!-- 上传完成后显示确认按钮 -->
+                <div v-if="uploadComplete" class="upload-complete">
+                  <el-alert title="文件上传成功" type="success" :closable="false" show-icon>
+                    <template #default>
+                      点击确认按钮开始新的上传
+                    </template>
+                  </el-alert>
+                  <el-button type="primary" @click="confirmUpload">
+                    确认完成
+                  </el-button>
+                </div>
               </div>
 
               <!-- 功能特点 -->
@@ -694,5 +1053,127 @@ onMounted(() => {
 .image-placeholder .el-icon,
 .image-error .el-icon {
   font-size: 24px;
+}
+
+:deep(.el-loading-spinner) {
+  .path {
+    stroke: var(--el-color-primary);
+    stroke-linecap: round;
+    animation: dash 1.5s ease-in-out infinite;
+  }
+
+  .el-loading-text {
+    font-size: 14px;
+    margin-top: 8px;
+  }
+}
+
+.chunks-progress {
+  margin: 1rem;
+  padding: 1rem;
+  border-radius: 8px;
+  background-color: var(--el-bg-color-page);
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+}
+
+.progress-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+
+  .progress-info {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+
+    h3 {
+      margin: 0;
+      font-size: 1rem;
+      color: var(--el-text-color-primary);
+    }
+
+    p {
+      margin: 0;
+      color: var(--el-text-color-secondary);
+    }
+  }
+}
+
+.chunks-list-container {
+  position: relative;
+  max-height: 300px;
+  overflow: hidden;
+  border: 1px solid var(--el-border-color-lighter);
+  border-radius: 4px;
+}
+
+.chunks-list {
+  padding: 0.5rem;
+  overflow-y: auto;
+  max-height: 300px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.chunk-item {
+  transition: all 0.3s ease;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.5rem;
+  background-color: var(--el-bg-color);
+  border-radius: 4px;
+
+  &.chunk-success {
+    opacity: 0.8;
+  }
+
+  span {
+    min-width: 80px;
+    color: var(--el-text-color-secondary);
+  }
+}
+
+.chunk-progress {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+
+  .el-progress {
+    flex: 1;
+  }
+}
+
+.merge-error {
+  margin-top: 0.5rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+
+  .el-alert {
+    width: 100%;
+  }
+}
+
+.upload-complete {
+  margin-top: 1rem;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  align-items: center;
+
+  .el-alert {
+    width: 100%;
+  }
+}
+
+/* 分片列表动画 */
+.chunk-list-move {
+  transition: transform 0.5s ease;
 }
 </style>

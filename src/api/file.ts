@@ -1,4 +1,4 @@
-import { get, postForm } from '@/utils/request'
+import { get, postForm, post } from '@/utils/request'
 import config from '@/config'
 
 // 文件信息接口
@@ -32,6 +32,22 @@ export interface PageParams {
   page: number
   size: number
   fileName?: string
+}
+
+// 文件配置接口
+export interface FileConfig {
+  chunkSize: number
+  maxFileSize: number
+  storageType: string
+}
+
+// 添加分片上传相关的接口
+export interface ChunkInfo {
+  chunk: Blob
+  index: number
+  hash: string
+  progress: number
+  status: 'ready' | 'uploading' | 'success' | 'error'
 }
 
 /**
@@ -159,5 +175,78 @@ export const fileApi = {
       reader.onerror = () => reject(reader.error)
       reader.readAsArrayBuffer(file)
     })
+  },
+
+  /**
+   * 获取文件配置
+   * @returns 文件配置信息
+   */
+  getConfig(): Promise<FileConfig> {
+    return get('/file/config')
+  },
+
+  /**
+   * 初始化分片上传
+   * @param fileInfo 文件信息
+   */
+  initiateMultipartUpload(fileInfo: Partial<FileInfo>): Promise<FileInfo> {
+    return post('/file/initiateMultipartUpload', fileInfo, {
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    })
+  },
+
+  /**
+   * 将文件分割成分片
+   * @param file 文件对象
+   * @param chunkSize 分片大小（MB）
+   * @returns 分片信息数组
+   */
+  createFileChunks(file: File, chunkSize: number): ChunkInfo[] {
+    const chunks: ChunkInfo[] = []
+    const chunkByteSize = chunkSize * 1024 * 1024
+    const totalChunks = Math.ceil(file.size / chunkByteSize)
+
+    for (let i = 0; i < totalChunks; i++) {
+      const start = i * chunkByteSize
+      const end = Math.min(file.size, start + chunkByteSize)
+      const chunk = file.slice(start, end)
+
+      chunks.push({
+        chunk,
+        index: i,
+        hash: `${file.name}-${i}`,
+        progress: 0,
+        status: 'ready',
+      })
+    }
+
+    return chunks
+  },
+
+  /**
+   * 上传分片
+   * @param uploadId 上传ID
+   * @param chunk 分片信息
+   * @returns 上传结果
+   */
+  uploadChunk(uploadId: string, chunk: ChunkInfo): Promise<void> {
+    const formData = new FormData()
+    formData.append('file', chunk.chunk)
+    formData.append('chunkNumber', chunk.index.toString())
+    formData.append('uploadId', uploadId)
+    return postForm('/file/uploadChunk', formData)
+  },
+
+  /**
+   * 合并分片
+   * @param uploadId 上传ID
+   * @returns 合并结果
+   */
+  mergeChunks(uploadId: string): Promise<void> {
+    const formData = new FormData()
+    formData.append('uploadId', uploadId)
+    return postForm('/file/mergeChunks', formData)
   },
 }
